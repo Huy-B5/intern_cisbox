@@ -1,11 +1,13 @@
 # controllers/account_api.py
 import json
+from datetime import datetime
+
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity, create_access_token, get_jwt
 from sqlalchemy import text
-from models import User
-from services.auth_service import login_user, add_to_blacklist, \
-    is_token_blacklisted, create_admin_user, register_user, update_user, delete_user
+from models import User, TokenBlacklist
+from services.auth_service import add_to_blacklist, \
+    is_token_blacklisted, create_admin_user, register_user, update_user, delete_user, login_user_as_user, login_admin
 from utils.common_utils import get_session
 
 account_bp = Blueprint('account', __name__)
@@ -31,8 +33,7 @@ def create_admin():
         return jsonify({'message': str(e)}), 400
 
 
-
-@account_bp.route('/login', methods=['POST'])
+@account_bp.route('/login_admin', methods=['POST'])
 def login():
     data = request.get_json()
     username = data.get('username')
@@ -43,9 +44,10 @@ def login():
         return jsonify({'message': 'Username, password, and company_no are required'}), 400
 
     try:
-        access_token, refresh_token = login_user(username, password, company_no)
+        access_token, refresh_token = login_admin(username, password, company_no)
+
         if not access_token:
-            return jsonify({"message": "Invalid credentials or not an admin for this company"}), 401
+            return jsonify({"message": "Invalid credentials or you are not an admin for this company"}), 401
 
         return jsonify({
             'access_token': access_token,
@@ -57,6 +59,34 @@ def login():
         return jsonify({"message": "An error occurred", "error": str(e)}), 500
 
 
+# controllers/account_api.py
+@account_bp.route('/login_user', methods=['POST'])
+def login_user_route():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    company_no = data.get('company_no')
+
+    if not username or not password or not company_no:
+        return jsonify({'message': 'Username, password, and company_no are required'}), 400
+
+    try:
+        access_token, refresh_token,user_data = login_user_as_user(username, password, company_no)
+
+        if not access_token:
+            return jsonify({"message": "Invalid credentials or you are not a user for this company"}), 401
+
+        return jsonify({
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'user_data': user_data
+        }), 200
+
+    except Exception as e:
+        return jsonify({"message": "An error occurred", "error": str(e)}), 500
+
+
+
 
 @account_bp.route('/refresh', methods=['POST'])
 @jwt_required(refresh=True)
@@ -66,27 +96,32 @@ def refresh():
 
     new_access_token = create_access_token(identity=user_identity)
     return jsonify(access_token=new_access_token), 200
-
-# Route logout
 @account_bp.route('/logout', methods=['POST'])
 @jwt_required()
 def logout():
     try:
-        current_user = get_jwt_identity()
-        print(f"Current user identity: {current_user}")
+        jwt_claims = get_jwt()
+        current_user_id = get_jwt_identity()
 
-        if not isinstance(current_user, dict):
-            return jsonify({'message': 'Invalid token data.'}), 400
+        print(f"Current user ID: {current_user_id}")
+        print(f"JWT Claims: {jwt_claims}")
 
-        if 'role' not in current_user:
+        if not jwt_claims:
+            return jsonify({'message': 'Token is invalid or expired.'}), 400
+
+        if 'role' not in jwt_claims:
             return jsonify({'message': 'Role is missing in the token data.'}), 400
 
-        if current_user.get('role') != 'admin':
-            add_to_blacklist()
+        if jwt_claims.get('role') == 'admin':
+            return jsonify({'message': 'Admin logged out successfully'}), 200
 
-        return jsonify({'message': 'Logged out successfully'}), 200
+        add_to_blacklist()
+
+        return jsonify({'message': 'Logged out successfully, token blacklisted.'}), 200
     except Exception as e:
+        print(f"Error during logout: {str(e)}")
         return jsonify({'message': 'Error logging out', 'error': str(e)}), 500
+
 
 
 @account_bp.route('/protected', methods=['POST'])
@@ -114,27 +149,37 @@ def admin():
     else:
         return jsonify(message="Permission denied."), 403
 
-
 @account_bp.route('/user', methods=['POST'])
-@jwt_required()
+@jwt_required()  # Ensure JWT is required to access this route
 def create_user():
-    current_user = get_jwt_identity()
-    if not isinstance(current_user, dict) or current_user.get('role') != 'admin':
+    # Get the user ID (identity) from the JWT token
+    current_user_id = get_jwt_identity()  # This is the user ID (as a string)
+    # Fetch user data based on the user ID from the database
+    session = next(get_session())
+    user = session.query(User).filter_by(id=current_user_id).first()
+
+    # Check if the current user is an admin
+    if not user or user.role != 'admin':
         return jsonify({'message': 'Permission denied. Admins only.'}), 403
 
-    admin_company_no = current_user.get('company_no')
+    admin_company_no = user.company_no  # Get the admin's company number
+
+    # Get the data from the request
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
     company_no = data.get('company_no')
 
+    # Validate input
     if not username or not password or not company_no:
         return jsonify({'message': 'Username, password, and company_no are required'}), 400
 
+    # Ensure admins can only create users within their company
     if admin_company_no != company_no:
         return jsonify({'message': 'Admins can only create users within their own company.'}), 403
 
-    return register_user(username, password, company_no, role =  'user')
+    # Call the function to register the user
+    return register_user(username, password, company_no, role='user')
 
 @account_bp.route('/user/<int:user_id>', methods=['PUT'])
 @jwt_required()

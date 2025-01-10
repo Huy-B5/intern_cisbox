@@ -27,5 +27,5 @@ check_connection()
 app.register_blueprint(controllers.api.account_bp, url_prefix='/account')
 
 if __name__ == '__main__':
-    app.run(debug=True, host=Config.HOST, port=Config.PORT)
+    app.run(host=Config.HOST, port=Config.PORT)
 

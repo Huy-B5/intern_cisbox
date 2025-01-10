@@ -3,6 +3,7 @@ from datetime import datetime
 from flask import jsonify
 from flask import request
 from flask_jwt_extended import create_access_token, create_refresh_token, get_jwt, get_jwt_identity
+from sqlalchemy.sql.functions import current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from models import User, Company, TokenBlacklist
 from utils.common_utils import get_session
@@ -68,21 +69,54 @@ def register_user(username, password, company_no, role='user'):
         session.close()
 
 
-def login_user(username, password, company_no):
+def login_admin(username, password, company_no):
     session = next(get_session())
     try:
         user = session.query(User).filter_by(username=username, company_no=company_no).first()
 
-        if user and check_password_hash(user.password_hash, password):
-            if user.role == 'admin':
-                access_token, refresh_token = create_token(user)
-                return access_token, refresh_token
+        if user:
+            if check_password_hash(user.password_hash, password):
+                if user.role == 'admin':
+                    access_token, refresh_token = create_token(user)
+                    return access_token, refresh_token
+                else:
+                    return None, None  # User is not an admin
             else:
-                return None, None
-        return None, None
+                return None, None  # Password is incorrect
+        return None, None  # User not found
 
     finally:
         session.close()
+
+# services/auth_service.py
+
+def login_user_as_user(username, password, company_no):
+    session = next(get_session())
+    try:
+        user = session.query(User).filter_by(username=username, company_no=company_no).first()
+
+        if user:
+            if check_password_hash(user.password_hash, password):
+                if user.role == 'user':
+                    # Exclude the password and return user data along with the tokens
+                    user_data = {
+                        'id': user.id,
+                        'username': user.username,
+                        'company_no': user.company_no,
+                        'created_at': user.created_at,
+                        'role': user.role,
+                    }
+                    access_token, refresh_token = create_token(user)
+                    return access_token, refresh_token, user_data
+                else:
+                    return None, None, None
+            else:
+                return None, None, None
+        return None, None, None
+
+    finally:
+        session.close()
+
 
 
 def get_all_users():
@@ -109,8 +143,22 @@ def update_user(user_id, data):
 
     session = next(get_session())
     try:
+        # Retrieve the user to be updated
         user = session.query(User).filter_by(id=user_id).one_or_none()
+
         if user:
+            # Get the company_no from the current user's JWT (admin)
+            current_user_company_no = get_jwt().get('company_no')
+
+            # Ensure that the admin can only update users from their own company
+            if current_user_company_no != user.company_no:
+                return jsonify({'message': 'Admins can only update users from their own company.'}), 403
+
+            # Check if role is 'admin' and attempt to change user to admin in a different company
+            if current_user_company_no != company_no and role == 'admin':
+                return jsonify({'message': 'Cannot change user role to admin for a different company.'}), 400
+
+            # Update the user details
             if username:
                 user.username = username
             if password:
@@ -119,20 +167,31 @@ def update_user(user_id, data):
                 user.company_no = company_no
             if role:
                 user.role = role
+
+            # Commit the changes to the database
             session.commit()
             return jsonify({'message': 'User updated successfully'}), 200
+
         return jsonify({'message': 'User not found'}), 404
+
     except Exception as e:
         session.rollback()
         return jsonify({'message': str(e)}), 400
     finally:
         session.close()
 
+
 def delete_user(user_id):
     session = next(get_session())
     try:
         user = session.query(User).filter_by(id=user_id).one_or_none()
         if user:
+            current_user_company_no = get_jwt().get('company_no')
+            if current_user_company_no != user.company_no:
+                return jsonify({'message': 'Admins can only delete users from their own company.'}), 403
+
+            if current_user_company_no == user.company_no and user.role == 'admin':
+                return jsonify({'message': 'Admins cannot delete themselves.'}), 403
             session.delete(user)
             session.commit()
             return jsonify({'message': 'User deleted successfully'}), 200
@@ -143,40 +202,50 @@ def delete_user(user_id):
     finally:
         session.close()
 
+
 def create_token(user):
-    access_token = create_access_token(identity={
-        "id": str(user.id),
+    # You can use the user ID as the identity, which should be a string
+    identity = str(user.id)  # Use user.id as the identity (ensure it's a string)
+
+    access_token = create_access_token(identity=identity, additional_claims={
         "username": str(user.username),
         "role": str(user.role),
         "company_no": str(user.company_no)
     })
-    refresh_token = create_refresh_token(identity={"id": str(user.id)})
+
+    refresh_token = create_refresh_token(identity=identity)
     return access_token, refresh_token
 
 
 
 #blacklisted_tokens = set()
-
 def add_to_blacklist():
-    current_user = get_jwt_identity()
+    # Get user information from the token
+    current_user = get_jwt_identity()  # Get the identity, which is the user_id
+    if not isinstance(current_user, str):
+        raise ValueError('Invalid token data.')  # If it's not a string (user ID), raise an error
 
-    if not isinstance(current_user, dict) or 'role' not in current_user or 'username' not in current_user:
-        raise ValueError('Invalid token data.')
+    # Get JWT claims
+    jwt_claims = get_jwt()  # This is a dictionary containing all claims from the token
+    # Check if 'role' exists in the claims
+    if 'role' not in jwt_claims:
+        raise ValueError('Role is missing in token data.')
 
-    if current_user.get('role') == 'admin':
-        return
+    # If the role is 'user', add the token to the blacklist
+    if jwt_claims.get('role') == 'user':
+        jti = jwt_claims.get('jti')  # Get the JTI value from the claims
+        session = next(get_session())
+        try:
+            token_entry = TokenBlacklist(jti=jti, created_at=datetime.utcnow())
+            session.add(token_entry)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
 
-    jti = get_jwt()["jti"]
-    session = next(get_session())
-    try:
-        token_entry = TokenBlacklist(jti=jti, created_at=datetime.utcnow())
-        session.add(token_entry)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        raise e
-    finally:
-        session.close()
+
 
 # Function to check if a token is blacklisted in the database
 def is_token_blacklisted(jti):
